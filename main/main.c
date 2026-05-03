@@ -4,6 +4,7 @@
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
+#include "esp_http_client.h"
 
 #define CAM_PIN_PWDN    32
 #define CAM_PIN_RESET   -1
@@ -26,6 +27,10 @@
 
 #define WIFI_SSID "Soi13"
 #define WIFI_PASS ""
+
+//Telegram credentials
+#define BOT_TOKEN ""
+#define CHAT_ID ""
 
 static const char *TAG = "ESP32-CAM";
 
@@ -72,7 +77,7 @@ static void wifi_init(void)
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(40)); //This method specifically for ESP32-C3, otherwise it will not connect to WiFi.
+    //ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(40)); //This method specifically for ESP32-C3, otherwise it will not connect to WiFi.
 }
 
 //Camera initialization
@@ -106,7 +111,7 @@ static esp_err_t camera_init(void)
 
         .frame_size = FRAMESIZE_QVGA,
         .jpeg_quality = 12,
-        .fb_count = 1,
+        .fb_count = 2,
 
         .grab_mode = CAMERA_GRAB_WHEN_EMPTY
     };
@@ -114,7 +119,77 @@ static esp_err_t camera_init(void)
     return esp_camera_init(&config);
 }
 
-//Capture image
+void send_photo(camera_fb_t *fb)
+{
+    char url[256];
+    snprintf(url, sizeof(url),
+        "https://api.telegram.org/bot%s/sendPhoto",
+        BOT_TOKEN);
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 15000,
+        .buffer_size = 1024,
+        .buffer_size_tx = 2048,
+        //.skip_cert_common_name_check = true, // simplify TLS
+        //.crt_bundle_attach = esp_crt_bundle_attach,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+
+    const char *boundary = "----esp32boundary";
+
+    char head[512];
+    int head_len = snprintf(head, sizeof(head),
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"CHAT_ID\"\r\n\r\n"
+        "%s\r\n"
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"photo\"; filename=\"cam.jpg\"\r\n"
+        "Content-Type: image/jpeg\r\n\r\n",
+        boundary, CHAT_ID, boundary);
+
+    char tail[64];
+    int tail_len = snprintf(tail, sizeof(tail),
+        "\r\n--%s--\r\n", boundary);
+
+    int total_len = head_len + fb->len + tail_len;
+
+    esp_http_client_set_header(client,
+        "Content-Type",
+        "multipart/form-data; boundary=----esp32boundary");
+
+    esp_http_client_open(client, total_len);
+
+    esp_http_client_write(client, head, head_len);
+    esp_http_client_write(client, (const char *)fb->buf, fb->len);
+    esp_http_client_write(client, tail, tail_len);
+
+    int status = esp_http_client_fetch_headers(client);
+    ESP_LOGI("HTTP", "Status = %d", status);
+
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+}
+
+void camera_task(void *pv)
+{
+    while (1) {
+        camera_fb_t *fb = esp_camera_fb_get();
+
+        if (fb) {
+            send_photo(fb);
+            esp_camera_fb_return(fb);
+        } else {
+            ESP_LOGE(TAG, "Capture failed");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
+}
+
+/*//Capture image
 void capture_photo(void)
 {
     camera_fb_t *fb = esp_camera_fb_get();
@@ -133,23 +208,21 @@ void capture_photo(void)
     printf("\n");
 
     esp_camera_fb_return(fb);
-}
+}*/
 
 void app_main(void)
 {
+    ESP_ERROR_CHECK(nvs_flash_init());
+    wifi_init();
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    
     if (camera_init() != ESP_OK) {
         ESP_LOGE(TAG, "Camera init failed!");
         return;
     }
-
-    //ESP_ERROR_CHECK(nvs_flash_init());
-    //wifi_init();
-    //vTaskDelay(pdMS_TO_TICKS(5000));
-
-    //printf("Camera initialized\n");
     ESP_LOGI(TAG, "Camera initialized");
 
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    xTaskCreate(camera_task, "cam_task", 8192, NULL, 5, NULL);
 
-    capture_photo();
+    //capture_photo();
 }
