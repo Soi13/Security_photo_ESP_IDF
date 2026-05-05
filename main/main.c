@@ -5,6 +5,9 @@
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "esp_http_client.h"
+#include "esp_crt_bundle.h"
+#include "esp_tls.h"
+
 
 #define CAM_PIN_PWDN    32
 #define CAM_PIN_RESET   -1
@@ -33,6 +36,116 @@
 #define CHAT_ID ""
 
 static const char *TAG = "ESP32-CAM";
+
+void telegram_send_photo(void)
+{
+    const char *host = "api.telegram.org";
+    const int port = 443;
+
+    // 1. Capture image from camera
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        ESP_LOGE(TAG, "Camera capture failed");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Image captured: %d bytes", fb->len);
+
+    // 2. TLS config
+    esp_tls_cfg_t cfg = {
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+
+    struct esp_tls *tls = esp_tls_init();
+    if (!tls) {
+        ESP_LOGE(TAG, "TLS init failed");
+        esp_camera_fb_return(fb);
+        return;
+    }
+
+    int ret = esp_tls_conn_new_sync(host, strlen(host), port, &cfg, tls);
+    if (ret != 1) {
+        ESP_LOGE(TAG, "TLS connect failed: %d", ret);
+        esp_tls_conn_destroy(tls);
+        esp_camera_fb_return(fb);
+        return;
+    }
+
+    ESP_LOGI(TAG, "TLS connected");
+
+    // 3. Multipart boundary
+    const char *boundary = "----esp32cam";
+
+    char header[512];
+    int header_len = snprintf(header, sizeof(header),
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n"
+        "%s\r\n"
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"photo\"; filename=\"photo.jpg\"\r\n"
+        "Content-Type: image/jpeg\r\n\r\n",
+        boundary, CHAT_ID, boundary
+    );
+
+    char footer[128];
+    int footer_len = snprintf(footer, sizeof(footer),
+        "\r\n--%s--\r\n",
+        boundary
+    );
+
+    // 4. HTTP request header
+    char req[256];
+    int req_len = snprintf(req, sizeof(req),
+        "POST /bot%s/sendPhoto HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "User-Agent: esp32\r\n"
+        "Content-Type: multipart/form-data; boundary=%s\r\n"
+        "Connection: close\r\n"
+        "Content-Length: %d\r\n"
+        "\r\n",
+        BOT_TOKEN,
+        host,
+        boundary,
+        header_len + fb->len + footer_len
+    );
+
+    // 5. Send HTTP header
+    esp_tls_conn_write(tls, req, req_len);
+    esp_tls_conn_write(tls, header, header_len);
+
+    // 6. Send image (stream-safe)
+    size_t sent = 0;
+    while (sent < fb->len) {
+        int w = esp_tls_conn_write(tls, (char *)fb->buf + sent, fb->len - sent);
+        if (w <= 0) {
+            ESP_LOGE(TAG, "Image write failed");
+            goto cleanup;
+        }
+        sent += w;
+    }
+
+    // 7. Send footer
+    esp_tls_conn_write(tls, footer, footer_len);
+
+    ESP_LOGI(TAG, "Photo sent");
+
+    // 8. Read response (optional)
+    char buf[512];
+    int r;
+    do {
+        r = esp_tls_conn_read(tls, buf, sizeof(buf) - 1);
+        if (r > 0) {
+            buf[r] = 0;
+            printf("%s", buf);
+        }
+    } while (r > 0);
+
+cleanup:
+    esp_tls_conn_destroy(tls);
+    esp_camera_fb_return(fb);
+
+    ESP_LOGI(TAG, "Done");
+}
 
 // Wifi event handler for displaying parameters of connection
 static void event_handler(void* arg, esp_event_base_t event_base,
@@ -107,7 +220,7 @@ static esp_err_t camera_init(void)
         .ledc_timer = LEDC_TIMER_0,
         .ledc_channel = LEDC_CHANNEL_0,
 
-        .pixel_format = PIXFORMAT_JPEG,  // important
+        .pixel_format = PIXFORMAT_JPEG,
 
         .frame_size = FRAMESIZE_QVGA,
         .jpeg_quality = 12,
@@ -118,97 +231,6 @@ static esp_err_t camera_init(void)
 
     return esp_camera_init(&config);
 }
-
-void send_photo(camera_fb_t *fb)
-{
-    char url[256];
-    snprintf(url, sizeof(url),
-        "https://api.telegram.org/bot%s/sendPhoto",
-        BOT_TOKEN);
-
-    esp_http_client_config_t config = {
-        .url = url,
-        .method = HTTP_METHOD_POST,
-        .timeout_ms = 15000,
-        .buffer_size = 1024,
-        .buffer_size_tx = 2048,
-        //.skip_cert_common_name_check = true, // simplify TLS
-        //.crt_bundle_attach = esp_crt_bundle_attach,
-    };
-
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-
-    const char *boundary = "----esp32boundary";
-
-    char head[512];
-    int head_len = snprintf(head, sizeof(head),
-        "--%s\r\n"
-        "Content-Disposition: form-data; name=\"CHAT_ID\"\r\n\r\n"
-        "%s\r\n"
-        "--%s\r\n"
-        "Content-Disposition: form-data; name=\"photo\"; filename=\"cam.jpg\"\r\n"
-        "Content-Type: image/jpeg\r\n\r\n",
-        boundary, CHAT_ID, boundary);
-
-    char tail[64];
-    int tail_len = snprintf(tail, sizeof(tail),
-        "\r\n--%s--\r\n", boundary);
-
-    int total_len = head_len + fb->len + tail_len;
-
-    esp_http_client_set_header(client,
-        "Content-Type",
-        "multipart/form-data; boundary=----esp32boundary");
-
-    esp_http_client_open(client, total_len);
-
-    esp_http_client_write(client, head, head_len);
-    esp_http_client_write(client, (const char *)fb->buf, fb->len);
-    esp_http_client_write(client, tail, tail_len);
-
-    int status = esp_http_client_fetch_headers(client);
-    ESP_LOGI("HTTP", "Status = %d", status);
-
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-}
-
-void camera_task(void *pv)
-{
-    while (1) {
-        camera_fb_t *fb = esp_camera_fb_get();
-
-        if (fb) {
-            send_photo(fb);
-            esp_camera_fb_return(fb);
-        } else {
-            ESP_LOGE(TAG, "Capture failed");
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(10000));
-    }
-}
-
-/*//Capture image
-void capture_photo(void)
-{
-    camera_fb_t *fb = esp_camera_fb_get();
-
-    if (!fb) {
-        printf("Camera capture failed\n");
-        return;
-    }
-
-    printf("Captured image: %d bytes\n", fb->len);
-
-    // Example: just print first few bytes
-    for (int i = 0; i < 10 && i < fb->len; i++) {
-        printf("%02X ", fb->buf[i]);
-    }
-    printf("\n");
-
-    esp_camera_fb_return(fb);
-}*/
 
 void app_main(void)
 {
@@ -222,7 +244,5 @@ void app_main(void)
     }
     ESP_LOGI(TAG, "Camera initialized");
 
-    xTaskCreate(camera_task, "cam_task", 8192, NULL, 5, NULL);
-
-    //capture_photo();
+    telegram_send_photo();
 }
