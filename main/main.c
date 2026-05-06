@@ -7,6 +7,7 @@
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "esp_tls.h"
+#include "driver/gpio.h"
 
 
 #define CAM_PIN_PWDN    32
@@ -28,6 +29,8 @@
 #define CAM_PIN_HREF    23
 #define CAM_PIN_PCLK    22
 
+#define FLASH_GPIO 4
+
 #define WIFI_SSID "Soi13"
 #define WIFI_PASS ""
 
@@ -37,17 +40,36 @@
 
 static const char *TAG = "ESP32-CAM";
 
+void flash_init(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = 1ULL << FLASH_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    gpio_config(&io_conf);
+}
+
 void telegram_send_photo(void)
 {
     const char *host = "api.telegram.org";
     const int port = 443;
 
+    gpio_set_level(FLASH_GPIO, 1); //Turn on flash
+    vTaskDelay(pdMS_TO_TICKS(100));
+
     // 1. Capture image from camera
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
         ESP_LOGE(TAG, "Camera capture failed");
+        gpio_set_level(FLASH_GPIO, 0);
         return;
     }
+
+    gpio_set_level(FLASH_GPIO, 0); //Turn off flash
 
     ESP_LOGI(TAG, "Image captured: %d bytes", fb->len);
 
@@ -234,6 +256,7 @@ static esp_err_t camera_init(void)
 
 void app_main(void)
 {
+    flash_init();
     ESP_ERROR_CHECK(nvs_flash_init());
     wifi_init();
     vTaskDelay(pdMS_TO_TICKS(5000));
