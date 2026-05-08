@@ -8,6 +8,7 @@
 #include "esp_crt_bundle.h"
 #include "esp_tls.h"
 #include "driver/gpio.h"
+#include "mqtt_client.h"
 
 
 #define CAM_PIN_PWDN    32
@@ -34,6 +35,11 @@
 #define WIFI_SSID "Soi13"
 #define WIFI_PASS ""
 
+// MQTT Server/Broker credentials
+#define MQTT_BROKER_URI "mqtt://192.168.1.64"
+#define MQTT_USER "mqtt_user"
+#define MQTT_PASSWORD ""
+
 //Telegram credentials
 #define BOT_TOKEN ""
 #define CHAT_ID ""
@@ -58,11 +64,24 @@ void telegram_send_photo(void)
     const char *host = "api.telegram.org";
     const int port = 443;
 
+    camera_fb_t *fb;
+
+    // Flush old frames
+    for (int i = 0; i < 2; i++) {
+        fb = esp_camera_fb_get();
+
+        if (fb) {
+            esp_camera_fb_return(fb);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+
     gpio_set_level(FLASH_GPIO, 1); //Turn on flash
     vTaskDelay(pdMS_TO_TICKS(100));
 
     // 1. Capture image from camera
-    camera_fb_t *fb = esp_camera_fb_get();
+    fb = esp_camera_fb_get();
     if (!fb) {
         ESP_LOGE(TAG, "Camera capture failed");
         gpio_set_level(FLASH_GPIO, 0);
@@ -215,6 +234,43 @@ static void wifi_init(void)
     //ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(40)); //This method specifically for ESP32-C3, otherwise it will not connect to WiFi.
 }
 
+//Create MQTT event handler
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+    esp_mqtt_event_handle_t event = event_data;
+
+    switch ((esp_mqtt_event_id_t)event_id) {
+        case MQTT_EVENT_CONNECTED:
+            esp_mqtt_client_subscribe(event->client, "homeassistant/sensor/front_door", 0);
+            break;
+
+        case MQTT_EVENT_DATA:
+            if (strncmp(event->data, "motion_detected", event->data_len) == 0) {
+                telegram_send_photo();
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+//Initializing MQTT
+static esp_mqtt_client_handle_t client = NULL;
+
+static void mqtt_app(void)
+{
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = MQTT_BROKER_URI,
+        .credentials.username = MQTT_USER,
+        .credentials.authentication.password = MQTT_PASSWORD,
+    };
+
+    client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(client);
+}
+
 //Camera initialization
 static esp_err_t camera_init(void)
 {
@@ -244,14 +300,30 @@ static esp_err_t camera_init(void)
 
         .pixel_format = PIXFORMAT_JPEG,
 
-        .frame_size = FRAMESIZE_QVGA,
-        .jpeg_quality = 12,
-        .fb_count = 2,
+        .frame_size = FRAMESIZE_SVGA,
+        .jpeg_quality = 10,
+        .fb_count = 1,
 
-        .grab_mode = CAMERA_GRAB_WHEN_EMPTY
+        .grab_mode = CAMERA_GRAB_LATEST
     };
 
     return esp_camera_init(&config);
+}
+
+void camera_adjustments(void)
+{
+    sensor_t *s = esp_camera_sensor_get();
+
+    //Enable auto white balance and exposure
+    s->set_whitebal(s, 1);
+    s->set_exposure_ctrl(s, 1);
+    s->set_gain_ctrl(s, 1);
+    //Adjust brightness and contrast
+    s->set_brightness(s, 1);
+    s->set_contrast(s, 1);
+    s->set_saturation(s, 1);
+    //Enable denoise
+    s->set_denoise(s, 1);
 }
 
 void app_main(void)
@@ -260,12 +332,14 @@ void app_main(void)
     ESP_ERROR_CHECK(nvs_flash_init());
     wifi_init();
     vTaskDelay(pdMS_TO_TICKS(5000));
-    
+
     if (camera_init() != ESP_OK) {
         ESP_LOGE(TAG, "Camera init failed!");
         return;
     }
+
+    camera_adjustments();
     ESP_LOGI(TAG, "Camera initialized");
 
-    telegram_send_photo();
+    mqtt_app();
 }
